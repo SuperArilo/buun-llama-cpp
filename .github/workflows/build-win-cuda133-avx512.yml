@@ -1,0 +1,231 @@
+# Windows x64: CUDA 13.3 (sm_89 / Ada) + AVX512 CPU backend + FA-all-quants -> ONE self-contained zip.
+# buun-llama-cpp needs GGML_CUDA_FA_ALL_QUANTS=ON for the turbo/TCQ KV codecs and VBR.
+name: Build (Windows x64 - CUDA 13.3 - AVX512)
+
+on:
+  workflow_dispatch: # allows manual triggering
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/build-win-cuda133-avx512.yml' # keep in sync with the real filename
+
+permissions:
+  contents: read
+
+concurrency:
+  group: win-cuda-avx512-master
+  cancel-in-progress: true # a corrected push kills the stale run instead of queueing behind it
+
+env:
+  ARTIFACT: buun-llama-bin-win-cuda-13.3-x64-avx512
+  # gh CLI inside Actions is unauthenticated without this - the publish job dies otherwise
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  windows-cuda:
+    name: windows-2022 / cuda 13.3 / avx512 / sm_89
+    runs-on: windows-2022
+    timeout-minutes: 350
+    permissions:
+      actions: write # ccache cleanup talks to the cache API
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # The fork's own composite action already pins the exact CUDA 13.3 redist archives.
+      - name: Install CUDA Toolkit 13.3
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.3'
+          cuda_arch: x64
+
+      - name: Install Ninja
+        shell: pwsh
+        run: choco install ninja -y --no-progress
+
+      # Every run rebuilds ~800 objects from scratch (~90 min). Cache them for the next round.
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: buun-win-2022-cuda-13.3-89real-avx512
+        env:
+          CCACHE_COMPILERCHECK: content
+
+      # NOTE: do NOT pass -Xcompiler=/Zc:__cplusplus here. It fixes the CUTLASS constexpr cascade in
+      # int8-channel.cu, but it also makes cuda.h declare CUtensorMap as alignas(128), which trips
+      # C2719 in mmq.cu (mmq-nvfp4-tma.cuh:103) - __grid_constant__ is not enough for the generated
+      # host stub. The C++17-ness CUTLASS needs now comes from the _MSVC_LANG tweak in
+      # ggml/src/ggml-cuda/bsa_vendor/cutlass/detail/helper_macros.hpp instead.
+      - name: Configure (AVX512 + CUDA sm_89 + FA all quants)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=ON ^
+            -DGGML_CPU_ALL_VARIANTS=OFF ^
+            -DGGML_AVX512=ON ^
+            -DGGML_CUDA=ON ^
+            -DGGML_CUDA_FA=ON ^
+            -DGGML_CUDA_FA_ALL_QUANTS=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES=89-real ^
+            -DLLAMA_BUILD_TESTS=OFF
+
+      # Read the flags back from the cache: a silently CPU-only, ISA-less or scalar-only-FA build
+      # goes green too.
+      - name: Show selected build flags
+        shell: pwsh
+        run: |
+          Select-String -Path build\CMakeCache.txt -Pattern '^(GGML_(AVX512|AVX2|CUDA|CUDA_FA|CUDA_FA_ALL_QUANTS|CPU|CPU_ALL_VARIANTS|NATIVE|BACKEND_DL)|CMAKE_CUDA_ARCHITECTURES):' | ForEach-Object { $_.Line }
+          Select-String -Path build\CMakeCache.txt -Pattern '^CUDAToolkit_VERSION:' | ForEach-Object { $_.Line }
+
+      - name: Show ninja files
+        shell: pwsh
+        run: Get-ChildItem build -Filter *.ninja | Select-Object Name, Length
+
+      # Last run died on this one TU with nothing but `FAILED: [code=1]` in the step log, because the
+      # build output was redirected into a file that never got printed. Compile it here, unredirected,
+      # so the actual nvcc diagnostic lands in the step log within minutes.
+      - name: Diagnose the CUDA TU that failed (int8-channel.cu)
+        if: always()
+        continue-on-error: true
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          ninja -C build -f build-Release.ninja -t commands "ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/Release/int8-channel.cu.obj"
+          echo === compiling int8-channel.cu alone ===
+          ninja -C build -f build-Release.ninja -j 2 "ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/Release/int8-channel.cu.obj" > tu.log 2>&1
+          set TU_RC=%ERRORLEVEL%
+          type tu.log
+          if %TU_RC% NEQ 0 for /F "usebackq tokens=*" %%L in (`findstr /C:"error" tu.log`) do echo ::error::%%L
+          if %TU_RC% EQU 0 echo ::notice::int8-channel.cu TU compiled clean
+          exit /b 0
+
+      # Publish the TU log immediately: the job log is only downloadable once the whole job ends,
+      # this artifact is readable minutes after this step finishes.
+      - name: Upload TU diagnostic log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: tu-diagnostic
+          path: tu.log
+          retention-days: 7
+
+      # Keep-going build with a heartbeat: the old version redirected every byte to build_output.log,
+      # so the live view looked frozen for an hour and the compiler error was invisible afterwards.
+      - name: Build
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          @'
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% -- -k 0 > build_output.log 2>&1
+          exit /b %ERRORLEVEL%
+          '@ | Set-Content -Path build_step.cmd -Encoding ascii
+          $p = Start-Process -FilePath cmd.exe -ArgumentList "/c build_step.cmd" -PassThru -NoNewWindow
+          while (-not $p.HasExited) {
+            Start-Sleep -Seconds 30
+            if (Test-Path build_output.log) {
+              Write-Host "--- tail @ $(Get-Date -Format HH:mm:ss) ---"
+              Get-Content build_output.log -Tail 6
+            }
+          }
+          $p.WaitForExit()
+          Write-Host "build exit code: $($p.ExitCode)"
+          Write-Host "--- failing lines ---"
+          Select-String -Path build_output.log -Pattern 'FAILED:','ninja: build stopped','error' | Select-Object -Last 60 | ForEach-Object { $_.Line }
+          echo "BUILD_RC=$($p.ExitCode)" >> $env:GITHUB_ENV
+          exit $p.ExitCode
+
+      # Redist DLLs live in bin\ and bin\x64\ - collect both or the archive silently ships none.
+      - name: Add CUDA runtime DLLs
+        if: always()
+        shell: pwsh
+        run: |
+          $out = "build\bin\Release"
+          foreach ($p in @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll', 'nvJitLink*.dll')) {
+            Copy-Item (Join-Path "$env:CUDA_PATH\bin" $p) $out -ErrorAction SilentlyContinue
+            Copy-Item (Join-Path "$env:CUDA_PATH\bin\x64" $p) $out -ErrorAction SilentlyContinue
+          }
+          Get-ChildItem $out | Sort-Object Name | Select-Object Name, Length | Format-Table -AutoSize
+
+      # Never gate packaging on a probe: a --version run exits non-zero on a runner without a GPU.
+      - name: Smoke test
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & .\build\bin\Release\llama-cli.exe --version
+          & .\build\bin\Release\llama-server.exe --version
+          & .\build\bin\Release\llama-cli.exe --list-devices
+
+      - name: Package
+        if: always()
+        shell: pwsh
+        run: |
+          $out = "build\bin\Release"
+          if (-not (Test-Path $out)) { throw "no build output at $out" }
+          $missing = @()
+          foreach ($f in @('llama-cli.exe', 'llama-server.exe')) {
+            if (-not (Test-Path (Join-Path $out $f))) { $missing += $f }
+          }
+          foreach ($g in @('ggml-cpu*.dll', 'ggml-cuda*.dll', 'cudart64_*.dll')) {
+            if (-not (Get-ChildItem (Join-Path $out $g) -ErrorAction SilentlyContinue)) { $missing += $g }
+          }
+          if ($missing.Count -gt 0) { throw "missing required files: $($missing -join ', ')" }
+          7z a -snl "${{ env.ARTIFACT }}.zip" ".\$out\*"
+          Get-Item "${{ env.ARTIFACT }}.zip" | Select-Object Name, Length
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ARTIFACT }}.zip
+          path: ${{ env.ARTIFACT }}.zip
+          retention-days: 30
+
+      # The unredirected build log is the only copy of the compiler diagnostics if the run fails.
+      - name: Upload build log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: build_output.log
+          path: build_output.log
+          retention-days: 30
+
+  publish:
+    name: publish release
+    needs: [windows-cuda]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # repo must also allow Read and write workflow permissions
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6 # gh release create needs a git repo, else `fatal: not a git repository`
+
+      - name: Download artifact
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: List files
+        run: find artifacts -type f | sort
+
+      - name: Create release
+        run: |
+          for f in artifacts/*/*.zip; do [ -f "$f" ] || { echo "missing asset"; exit 1; }; done
+          gh release create "win-cuda-13.3-avx512-r${GITHUB_RUN_NUMBER}" \
+            --title "Win x64 CUDA 13.3 AVX512 (r${GITHUB_RUN_NUMBER}, ${GITHUB_SHA:0:8})" \
+            --repo "$GITHUB_REPOSITORY" \
+            --notes "buun-llama-cpp Windows x64 / CUDA 13.3 (sm_89) / AVX512-only CPU backend / GGML_CUDA_FA_ALL_QUANTS=ON for the turbo+TCQ KV codecs. Self-contained: unzip and run." \
+            artifacts/*/*.zip
